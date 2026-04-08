@@ -1,0 +1,1 @@
+/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/parralel-head-aches.dir/link.d "CMakeFiles/parralel-head-aches.dir/main.cpp.o" -o parralel-head-aches  /usr/lib/libOpenCL.so

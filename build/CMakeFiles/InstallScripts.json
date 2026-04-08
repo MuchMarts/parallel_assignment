@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/muchmarts/Projects/parallel-head-aches/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
