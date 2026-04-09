@@ -4,6 +4,7 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -187,7 +188,204 @@ void debugPrintBuffer(cl_command_queue queue, cl_mem buffer, int size, const std
     std::cout << "\n";
 }
 
+enum class BitDepth : uint8_t { U8 = 8, U16 = 16 };
+
+struct ImageDescriptor {
+    uint32_t width;
+    uint32_t height;
+    BitDepth bitDepth;
+    bool     isGrayscale;  // if true, only planes[0] (Y) is valid
+};
+
+struct ImageBuffers {
+    ImageDescriptor desc;
+    cl_mem planes[3];  // [0]=Y, [1]=Cb, [2]=Cr
+    uint32_t   planeCount; // 1 for grayscale, 3 for YCbCr
+};
+
+// Supported image configurations:
+// Channels: 1, 3
+// Bit Depth: 8, 16
 int processImage(const std::string& path) {
+    std::cout << "Processing image" << path << std::endl;
+    
+    // Initialize structs
+    int width, height, channels;
+    ImageDescriptor imageDesc = {};
+    ImageBuffers imageBuffers = {};
+    imageBuffers.desc = imageDesc;
+
+    int ok = stbi_info(path.c_str(), &width, &height, &channels);
+    if (!ok) {
+        std::cerr << "Failed to get image info\n";
+        return 1;
+    }
+
+    imageDesc.width = width;
+    imageDesc.height = height;
+    imageDesc.isGrayscale = (channels == 1);
+    imageDesc.bitDepth = stbi_is_16_bit(path.c_str()) ? BitDepth::U16 : BitDepth::U8;
+
+    if (channels != 3 && channels != 1) {
+        std::cerr << "Unsupported number of channels: " << channels << "\n";
+        return 1;
+    }
+    imageBuffers.planeCount = channels;
+    size_t PIXEL_COUNT = width * height;
+
+    // OpenCL setup
+    cl_int err;
+
+    cl_platform_id platform;
+    CL_CHECK(clGetPlatformIDs(1, &platform, NULL));
+
+    cl_device_id device;
+    CL_CHECK(clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &device, NULL));
+
+    cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
+    CL_CHECK(err);
+
+    cl_queue_properties props[] = {
+        CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE,
+        0
+    };
+    cl_command_queue queue = clCreateCommandQueueWithProperties(
+        context, device, props, &err);
+    CL_CHECK(err);
+
+    // Load image data and create buffers
+    if (imageDesc.bitDepth == BitDepth::U8){
+        unsigned char* image_8b = stbi_load(path.c_str(), &width, &height, &channels, 0);
+        if (!image_8b) {
+            std::cerr << "Failed to load image\n";
+            return 1;
+        }
+
+        if (imageDesc.isGrayscale) {
+            std::cout << "Loaded grayscale image: w=" << width << " h=" << height << " c=" << channels << "\n";
+            // Allocate memory for the grayscale plane
+            imageBuffers.planes[0] = allocPlane(context, width, height, imageDesc.bitDepth, &err);
+            CL_CHECK(err);
+        } else {
+            std::cout << "Loaded color image: w=" << width << " h=" << height << " c=" << channels << "\n";
+            // Convert to YCbCr
+            std::vector<uint8_t> planeY (PIXEL_COUNT);
+            std::vector<uint8_t> planeCb(PIXEL_COUNT);
+            std::vector<uint8_t> planeCr(PIXEL_COUNT);
+
+            for (size_t i = 0; i < PIXEL_COUNT; i++) {
+                float r = (float)image_8b[i * 3 + 0];
+                float g = (float)image_8b[i * 3 + 1];
+                float b = (float)image_8b[i * 3 + 2];
+
+                // Convert RGB to YCbCr
+                planeY [i] = (uint8_t)std::clamp((0.299f * r + 0.587f * g + 0.114f * b), 0.0f, 255.0f);
+                planeCb[i] = (uint8_t)std::clamp((-0.168736f * r - 0.331264f * g + 0.5f * b + 128.0f), 0.0f, 255.0f);
+                planeCr[i] = (uint8_t)std::clamp((0.5f * r - 0.418688f * g - 0.081312f * b + 128.0f), 0.0f, 255.0f);
+            }
+
+            for (uint32_t i = 0; i < 3; i++) {
+                imageBuffers.planes[i] = allocPlane(context, width, height, imageDesc.bitDepth, &err);
+                if (err != CL_SUCCESS) {
+                    freeImageBuffers(imageBuffers);
+                    std::cout << "Failed to allocate memory for image planes\n"; 
+                    return 1;
+                }
+            }
+        }
+        stbi_image_free(image_8b);
+    } else {
+        // 16-bit image loading 
+        unsigned short* image_16b = (unsigned short*)stbi_load_16(path.c_str(), &width, &height, &channels, 0);
+        if (!image_16b) {
+            std::cerr << "Failed to load 16-bit image\n";
+            return 1;
+        }
+
+        if (imageDesc.isGrayscale) {
+            std::cout << "Loaded grayscale 16-bit image: w=" << width << " h=" << height << " c=" << channels << "\n";
+            imageBuffers.planes[0] = allocPlane(context, width, height, imageDesc.bitDepth, &err);
+            CL_CHECK(err);
+        } else {
+            std::cout << "Loaded color 16-bit image: w=" << width << " h=" << height << " c=" << channels << "\n";
+            // Convert to YCbCr
+            std::vector<uint16_t> planeY (PIXEL_COUNT);
+            std::vector<uint16_t> planeCb(PIXEL_COUNT);
+            std::vector<uint16_t> planeCr(PIXEL_COUNT);
+
+            for (size_t i = 0; i < PIXEL_COUNT; i++) {
+                float r = (float)image_16b[i * 3 + 0];
+                float g = (float)image_16b[i * 3 + 1];
+                float b = (float)image_16b[i * 3 + 2];
+
+                // Convert RGB to YCbCr
+                planeY [i] = (uint16_t)std::clamp((0.299f * r + 0.587f * g + 0.114f * b), 0.0f, 65535.0f);
+                planeCb[i] = (uint16_t)std::clamp((-0.168736f * r - 0.331264f * g + 0.5f * b + 32768.0f), 0.0f, 65535.0f);
+                planeCr[i] = (uint16_t)std::clamp((0.5f * r - 0.418688f * g - 0.081312f * b + 32768.0f), 0.0f, 65535.0f);
+            }
+
+            for (uint32_t i = 0; i < 3; i++) {
+                imageBuffers.planes[i] = allocPlane(context, width, height, imageDesc.bitDepth, &err);
+                if (err != CL_SUCCESS) {
+                    freeImageBuffers(imageBuffers);
+                    std::cout << "Failed to allocate memory for image planes\n"; 
+                    return 1;
+                }
+            }
+        }
+        stbi_image_free(image_16b);
+    }
+
+
+
+    
+    // Release stuff at end
+    freeImageBuffers(imageBuffers);
+    //clReleaseKernel(kernel);
+    //clReleaseProgram(program);
+    clReleaseCommandQueue(queue);
+    clReleaseContext(context);
+    
+    return 0;
+}
+
+
+
+// HELPER: Allocate memory for a single image plane
+cl_mem allocPlane(
+    cl_context  context,
+    size_t      width,
+    size_t      height,
+    BitDepth    bitDepth,
+    cl_int*     err)
+{
+    size_t elementSize = (bitDepth == BitDepth::U16) ? sizeof(uint16_t) : sizeof(uint8_t);
+    size_t bufferSize  = width * height * elementSize;
+
+    cl_int localErr;
+    cl_mem mem = clCreateBuffer(context, CL_MEM_READ_WRITE, bufferSize, nullptr, &localErr);
+
+    if (localErr != CL_SUCCESS) {
+        if (err) *err = localErr;
+        return nullptr;
+    }
+
+    if (err) *err = CL_SUCCESS;
+    return mem;
+}
+
+// HELPER: Free image buffers
+void freeImageBuffers(ImageBuffers& buffers) {
+    for (uint32_t i = 0; i < buffers.planeCount; i++) {
+        if (buffers.planes[i]) {
+            clReleaseMemObject(buffers.planes[i]);
+            buffers.planes[i] = nullptr;
+        }
+    }
+    buffers.planeCount = 0;
+}
+
+int processImage2(const std::string& path) {
     std::cout << "Processing image" << path << std::endl;
 
     int width, height, channels;
