@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/histeq.dir/link.d CMakeFiles/histeq.dir/main.cpp.o -o histeq  /usr/lib/libOpenCL.so

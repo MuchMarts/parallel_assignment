@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/muchmarts/Projects/parallel_assignment/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

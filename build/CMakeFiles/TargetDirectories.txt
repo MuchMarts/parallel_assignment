@@ -1,3 +1,0 @@
-/home/muchmarts/Projects/parallel_assignment/build/CMakeFiles/histeq.dir
-/home/muchmarts/Projects/parallel_assignment/build/CMakeFiles/edit_cache.dir
-/home/muchmarts/Projects/parallel_assignment/build/CMakeFiles/rebuild_cache.dir
