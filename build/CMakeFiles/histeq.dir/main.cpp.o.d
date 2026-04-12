@@ -1,5 +1,5 @@
 CMakeFiles/histeq.dir/main.cpp.o: \
- /home/muchmarts/Projects/parallel-head-aches/main.cpp \
+ /home/muchmarts/Projects/parallel_assignment/main.cpp \
  /usr/include/stdc-predef.h /usr/include/c++/15.2.1/filesystem \
  /usr/include/c++/15.2.1/bits/requires_hosted.h \
  /usr/include/c++/15.2.1/x86_64-pc-linux-gnu/bits/c++config.h \
@@ -179,7 +179,15 @@ CMakeFiles/histeq.dir/main.cpp.o: \
  /usr/include/c++/15.2.1/x86_64-pc-linux-gnu/bits/basic_file.h \
  /usr/include/c++/15.2.1/x86_64-pc-linux-gnu/bits/c++io.h \
  /usr/include/c++/15.2.1/bits/fstream.tcc \
- /home/muchmarts/Projects/parallel-head-aches/include/stb_image.h \
+ /usr/include/c++/15.2.1/algorithm \
+ /usr/include/c++/15.2.1/bits/stl_algo.h \
+ /usr/include/c++/15.2.1/bits/algorithmfwd.h \
+ /usr/include/c++/15.2.1/bits/stl_heap.h \
+ /usr/include/c++/15.2.1/bits/uniform_int_dist.h \
+ /usr/include/c++/15.2.1/bits/stl_tempbuf.h \
+ /usr/include/c++/15.2.1/pstl/glue_algorithm_defs.h \
+ /usr/include/c++/15.2.1/pstl/execution_defs.h \
+ /home/muchmarts/Projects/parallel_assignment/include/stb_image.h \
  /usr/include/c++/15.2.1/stdlib.h /usr/include/string.h \
  /usr/include/strings.h \
  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/include/limits.h \
@@ -211,6 +219,6 @@ CMakeFiles/histeq.dir/main.cpp.o: \
  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/include/xmmintrin.h \
  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/include/mmintrin.h \
  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/include/mm_malloc.h \
- /home/muchmarts/Projects/parallel-head-aches/include/stb_image_write.h \
+ /home/muchmarts/Projects/parallel_assignment/include/stb_image_write.h \
  /usr/include/CL/cl.h /usr/include/CL/cl_version.h \
  /usr/include/CL/cl_platform.h

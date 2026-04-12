@@ -54,10 +54,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/muchmarts/Projects/parallel-head-aches
+CMAKE_SOURCE_DIR = /home/muchmarts/Projects/parallel_assignment
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/muchmarts/Projects/parallel-head-aches/build
+CMAKE_BINARY_DIR = /home/muchmarts/Projects/parallel_assignment/build
 
 #=============================================================================
 # Directory level rules for the build root directory
@@ -85,14 +85,14 @@ clean: CMakeFiles/histeq.dir/clean
 CMakeFiles/histeq.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/histeq.dir/build.make CMakeFiles/histeq.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/histeq.dir/build.make CMakeFiles/histeq.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/muchmarts/Projects/parallel-head-aches/build/CMakeFiles --progress-num=1,2 "Built target histeq"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/muchmarts/Projects/parallel_assignment/build/CMakeFiles --progress-num=1,2 "Built target histeq"
 .PHONY : CMakeFiles/histeq.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/histeq.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/muchmarts/Projects/parallel-head-aches/build/CMakeFiles 2
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/muchmarts/Projects/parallel_assignment/build/CMakeFiles 2
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/histeq.dir/all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/muchmarts/Projects/parallel-head-aches/build/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/muchmarts/Projects/parallel_assignment/build/CMakeFiles 0
 .PHONY : CMakeFiles/histeq.dir/rule
 
 # Convenience name for target.
@@ -102,7 +102,7 @@ histeq: CMakeFiles/histeq.dir/rule
 # codegen rule for target.
 CMakeFiles/histeq.dir/codegen:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/histeq.dir/build.make CMakeFiles/histeq.dir/codegen
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/muchmarts/Projects/parallel-head-aches/build/CMakeFiles --progress-num=1,2 "Finished codegen for target histeq"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/muchmarts/Projects/parallel_assignment/build/CMakeFiles --progress-num=1,2 "Finished codegen for target histeq"
 .PHONY : CMakeFiles/histeq.dir/codegen
 
 # clean rule for target.

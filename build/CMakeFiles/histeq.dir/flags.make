@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = -DCL_TARGET_OPENCL_VERSION=300
 
-CXX_INCLUDES = -I/home/muchmarts/Projects/parallel-head-aches/include
+CXX_INCLUDES = -I/home/muchmarts/Projects/parallel_assignment/include
 
 CXX_FLAGS = -std=gnu++17
 

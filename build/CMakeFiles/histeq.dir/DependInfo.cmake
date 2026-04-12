@@ -8,7 +8,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 
 # The set of dependency files which are needed:
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
-  "/home/muchmarts/Projects/parallel-head-aches/main.cpp" "CMakeFiles/histeq.dir/main.cpp.o" "gcc" "CMakeFiles/histeq.dir/main.cpp.o.d"
+  "/home/muchmarts/Projects/parallel_assignment/main.cpp" "CMakeFiles/histeq.dir/main.cpp.o" "gcc" "CMakeFiles/histeq.dir/main.cpp.o.d"
   "" "histeq" "gcc" "CMakeFiles/histeq.dir/link.d"
   )
 
