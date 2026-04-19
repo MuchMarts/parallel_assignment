@@ -164,9 +164,11 @@ GetOpenCLErrorString(int error)
 
 namespace fs = std::filesystem;
 
+const bool DEBUG_MESSAGES = false;
+
 bool isImageFile(const fs::path& path) {
     std::string ext = path.extension().string();
-    return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp";
+    return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" || ext == ".pgm";
 }
 
 std::string readFile(const std::string& path) {
@@ -193,6 +195,13 @@ struct ImageDescriptor {
     uint32_t height;
     BitDepth bitDepth;
     bool     isGrayscale;  // if true, only planes[0] (Y) is valid
+};
+
+struct RawImageData {
+    // For 8b images
+    std::vector<uint8_t>  data8;
+    // For 16b images
+    std::vector<uint16_t> data16;
 };
 
 struct ImageBuffers {
@@ -235,6 +244,17 @@ void freeImageBuffers(ImageBuffers& buffers) {
     buffers.planeCount = 0;
 }
 
+static cl_ulong eventDurationUs(const std::vector<cl_event>& events) {
+    cl_ulong total = 0;
+    for (cl_event e : events) {
+        cl_ulong start, end;
+        clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &start, nullptr);
+        clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END,   sizeof(cl_ulong), &end,   nullptr);
+        total += (end - start) / 1000;
+    }
+    return total;
+}
+
 struct OpenCLResources {
     std::string output_postfix;
     std::string program_source;
@@ -253,7 +273,66 @@ OpenCLResources NAIVE_IMPLEMENTATION = OpenCLResources{
     .output_kernel = (char *)"Backproject"
 };
 
-int processOpenCL(OpenCLResources& resources, ImageBuffers& imageBuffers, cl_context context, cl_command_queue queue, cl_device_id device, const std::string& path) {
+struct CSVDataRow {
+    std::string buildID;
+    std::string imageName;
+    std::string implementation;
+    ImageDescriptor imageDescriptor;
+    
+    // Kernel timings
+    cl_ulong histogramTimeUs;
+    cl_ulong scanTimeUs;
+    cl_ulong normScaleTimeUs;
+
+    // Transfer timings
+    cl_ulong hostToDeviceTimeUs;
+    cl_ulong deviceToHostTimeUs;
+    size_t   hostToDeviceBytes;
+    size_t   deviceToHostBytes;
+};
+
+static void writeCSV(const CSVDataRow& row) {
+    const std::string csvPath = "results.csv";
+    bool needsHeader = !fs::exists(csvPath);
+ 
+    std::ofstream f(csvPath, std::ios::app);
+    if (!f.is_open()) {
+        std::cerr << "Failed to open " << csvPath << " for writing\n";
+        return;
+    }
+ 
+    if (needsHeader) {
+        f << "build_id,image_name,implementation,"
+          << "width,height,bit_depth,is_grayscale,"
+          << "histogram_us,scan_us,norm_scale_us,"
+          << "h2d_us,h2d_bytes,d2h_us,d2h_bytes\n";
+    }
+ 
+    f << row.buildID                                           << ','
+      << row.imageName                                       << ','
+      << row.implementation                                  << ','
+      << row.imageDescriptor.width                          << ','
+      << row.imageDescriptor.height                         << ','
+      << static_cast<int>(row.imageDescriptor.bitDepth)     << ','
+      << (row.imageDescriptor.isGrayscale ? "true" : "false") << ','
+      << row.histogramTimeUs                                 << ','
+      << row.scanTimeUs                                      << ','
+      << row.normScaleTimeUs                                 << ','
+      << row.hostToDeviceTimeUs                              << ','
+      << row.hostToDeviceBytes                               << ','
+      << row.deviceToHostTimeUs                              << ','
+      << row.deviceToHostBytes                               << '\n';
+}
+
+CSVDataRow processOpenCL(
+    OpenCLResources& resources, 
+    ImageDescriptor& imageDescriptor, 
+    RawImageData& rawData,
+    cl_context context, 
+    cl_command_queue queue, 
+    cl_device_id device, 
+    const std::string& path
+) {
     std::cout << "Processing OpenCL for image: " << path << std::endl;
     cl_int err;
     
@@ -263,12 +342,11 @@ int processOpenCL(OpenCLResources& resources, ImageBuffers& imageBuffers, cl_con
     cl_program program = clCreateProgramWithSource(context, 1, &src, NULL, &err);
     CL_CHECK(err);
 
-    const char* build_opts = imageBuffers.desc.bitDepth == BitDepth::U16
-    ? "-cl-fast-relaxed-math -cl-mad-enable -DDEPTH_16"
-    : "-cl-fast-relaxed-math -cl-mad-enable -DDEPTH_8";
+    const char* build_opts = (imageDescriptor.bitDepth == BitDepth::U16)
+        ? "-cl-fast-relaxed-math -cl-mad-enable -DDEPTH_16"
+        : "-cl-fast-relaxed-math -cl-mad-enable -DDEPTH_8";
 
     err = clBuildProgram(program, 1, &device, build_opts, NULL, NULL);
-
     if (err != CL_SUCCESS) {
         size_t log_size;
         clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
@@ -277,12 +355,77 @@ int processOpenCL(OpenCLResources& resources, ImageBuffers& imageBuffers, cl_con
         clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), NULL);
 
         std::cerr << "Build failed:\n" << log.data() << std::endl;
-        return 1;
+        return CSVDataRow{};
     }
 
-    uint32_t numBuckets   = (imageBuffers.desc.bitDepth == BitDepth::U16) ? 65536 : 256;
-    uint32_t maxIntensity = (imageBuffers.desc.bitDepth == BitDepth::U16) ? 65535 : 255;
-    size_t   pixelCount   = imageBuffers.desc.width * imageBuffers.desc.height;
+    uint32_t numBuckets   = (imageDescriptor.bitDepth == BitDepth::U16) ? 65536 : 256;
+    uint32_t maxIntensity = (imageDescriptor.bitDepth == BitDepth::U16) ? 65535 : 255;
+    size_t   pixelCount   = imageDescriptor.width * imageDescriptor.height;
+
+    // Allocate image planes
+    ImageBuffers imageBuffers = {};
+    imageBuffers.desc = imageDescriptor;
+    imageBuffers.planeCount = imageDescriptor.isGrayscale ? 1 : 3;
+
+    for (uint32_t i = 0; i < imageBuffers.planeCount; i++) {
+        imageBuffers.planes[i] = allocPlane(context, imageBuffers.desc.width, imageBuffers.desc.height, imageBuffers.desc.bitDepth, &err);
+        CL_CHECK(err);
+    }
+
+    // Host to Device transfers
+    std::vector<cl_event> writeEvents;
+    size_t h2dBytes = 0;
+ 
+    auto enqueueWrite = [&](cl_mem buf, const void* ptr, size_t bytes) {
+        cl_event ev;
+        CL_CHECK(clEnqueueWriteBuffer(queue, buf, CL_FALSE, 0, bytes, ptr, 0, NULL, &ev));
+        writeEvents.push_back(ev);
+        h2dBytes += bytes;
+    };
+
+    if (imageBuffers.desc.bitDepth == BitDepth::U8) {
+        if (imageBuffers.desc.isGrayscale) {
+            enqueueWrite(imageBuffers.planes[0], rawData.data8.data(), pixelCount * sizeof(uint8_t));
+        } else {
+            std::vector<uint8_t> planeY(pixelCount), planeCb(pixelCount), planeCr(pixelCount);
+            for (size_t i = 0; i < pixelCount; i++) {
+                float r = rawData.data8[i * 3 + 0];
+                float g = rawData.data8[i * 3 + 1];
+                float b = rawData.data8[i * 3 + 2];
+                
+                planeY [i] = (uint8_t)std::clamp( 0.299f*r + 0.587f*g + 0.114f*b,           0.f, 255.f);
+                planeCb[i] = (uint8_t)std::clamp(-0.168736f*r - 0.331264f*g + 0.5f*b + 128.f, 0.f, 255.f);
+                planeCr[i] = (uint8_t)std::clamp( 0.5f*r - 0.418688f*g - 0.081312f*b + 128.f, 0.f, 255.f);
+            }
+
+            enqueueWrite(imageBuffers.planes[0], planeY.data(),  pixelCount * sizeof(uint8_t));
+            enqueueWrite(imageBuffers.planes[1], planeCb.data(), pixelCount * sizeof(uint8_t));
+            enqueueWrite(imageBuffers.planes[2], planeCr.data(), pixelCount * sizeof(uint8_t));
+        }
+    } else {
+        if (imageBuffers.desc.isGrayscale) {
+            enqueueWrite(imageBuffers.planes[0], rawData.data16.data(), pixelCount * sizeof(uint16_t));
+        } else {
+            std::vector<uint16_t> planeY(pixelCount), planeCb(pixelCount), planeCr(pixelCount);
+            for (size_t i = 0; i < pixelCount; i++) {
+                float r = rawData.data16[i * 3 + 0];
+                float g = rawData.data16[i * 3 + 1];
+                float b = rawData.data16[i * 3 + 2];
+                
+                planeY [i] = (uint16_t)std::clamp( 0.299f*r + 0.587f*g + 0.114f*b,               0.f, 65535.f);
+                planeCb[i] = (uint16_t)std::clamp(-0.168736f*r - 0.331264f*g + 0.5f*b + 32768.f,  0.f, 65535.f);
+                planeCr[i] = (uint16_t)std::clamp( 0.5f*r - 0.418688f*g - 0.081312f*b + 32768.f,  0.f, 65535.f);
+            }
+
+            enqueueWrite(imageBuffers.planes[0], planeY.data(),  pixelCount * sizeof(uint16_t));
+            enqueueWrite(imageBuffers.planes[1], planeCb.data(), pixelCount * sizeof(uint16_t));
+            enqueueWrite(imageBuffers.planes[2], planeCr.data(), pixelCount * sizeof(uint16_t));
+        }
+    }
+    // Wait for all writes to complete before kernels run
+    clWaitForEvents((cl_uint)writeEvents.size(), writeEvents.data());
+ 
+
 
     // Load all kenels
     cl_kernel histogram_kernel = clCreateKernel(program, resources.histogram_kernel, &err);
@@ -297,49 +440,20 @@ int processOpenCL(OpenCLResources& resources, ImageBuffers& imageBuffers, cl_con
     CL_CHECK(err);
 
     // Create needed buffers
-    cl_mem histogram_buffer = clCreateBuffer(
-        context,
-        CL_MEM_READ_WRITE,
-        numBuckets * sizeof(uint32_t),
-        NULL,
-        &err);
+    cl_mem histogram_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, numBuckets * sizeof(uint32_t), NULL, &err);
     CL_CHECK(err);
-
-    cl_mem cumulative_hist_buffer = clCreateBuffer(
-        context,
-        CL_MEM_READ_WRITE,
-        numBuckets * sizeof(uint32_t),
-        NULL,
-        &err);
+    cl_mem cumulative_hist_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, numBuckets * sizeof(uint32_t), NULL, &err);
     CL_CHECK(err);
-
-    cl_mem lut_buffer = clCreateBuffer(
-        context,
-        CL_MEM_READ_WRITE,
-        numBuckets * sizeof(uint32_t),
-        NULL,
-        &err);
+    cl_mem lut_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, numBuckets * sizeof(uint32_t), NULL, &err);
     CL_CHECK(err);
 
     size_t elementSize = (imageBuffers.desc.bitDepth == BitDepth::U16) ? sizeof(uint16_t) : sizeof(uint8_t);
-    size_t outputSize = imageBuffers.desc.isGrayscale
-    ? pixelCount * elementSize
-    : pixelCount * elementSize * 3;
+    size_t outputSizeGray = pixelCount * elementSize;
+    size_t outputSize = (imageBuffers.desc.isGrayscale) ? outputSizeGray : outputSizeGray * 3;
 
-    cl_mem equalized_y_buffer = clCreateBuffer(
-        context, 
-        CL_MEM_READ_WRITE, 
-        outputSize,
-        NULL, 
-        &err);
+    cl_mem equalized_y_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, outputSize, NULL, &err);
     CL_CHECK(err);
-
-    cl_mem output_buffer = clCreateBuffer(
-        context,
-        CL_MEM_WRITE_ONLY,
-        outputSize,
-        NULL,
-        &err);
+    cl_mem output_buffer = clCreateBuffer(context, CL_MEM_WRITE_ONLY, outputSize, NULL, &err);
     CL_CHECK(err);
     
 
@@ -364,7 +478,6 @@ int processOpenCL(OpenCLResources& resources, ImageBuffers& imageBuffers, cl_con
     clSetKernelArg(output_kernel, 0, sizeof(cl_mem), &imageBuffers.planes[0]);
     clSetKernelArg(output_kernel, 1, sizeof(cl_mem), &lut_buffer);
     clSetKernelArg(output_kernel, 2, sizeof(cl_mem), &equalized_y_buffer);
-
     // # YCbCr_to_RGB
     clSetKernelArg(ycbcr_to_rgb_kernel, 0, sizeof(cl_mem), &equalized_y_buffer);
     clSetKernelArg(ycbcr_to_rgb_kernel, 1, sizeof(cl_mem), &imageBuffers.planes[1]);
@@ -372,288 +485,183 @@ int processOpenCL(OpenCLResources& resources, ImageBuffers& imageBuffers, cl_con
     clSetKernelArg(ycbcr_to_rgb_kernel, 3, sizeof(cl_mem), &output_buffer);
     clSetKernelArg(ycbcr_to_rgb_kernel, 4, sizeof(uint), &pixelCount);
 
+    //
     // Enqueue kernels
-    
-    // Launch histogram kernel
+    //
     size_t local  = 64;
     size_t global = ((pixelCount + local - 1) / local) * local;
-    cl_event histogram_event;
+    
+    cl_event histogram_event, scan_event, norm_event, out_event;
+
     CL_CHECK(clEnqueueNDRangeKernel(queue, histogram_kernel, 1, NULL, &global, &local, 0, NULL, &histogram_event));
     clWaitForEvents(1, &histogram_event);
-    //debugPrintBuffer(queue, histogram_buffer, numBuckets, "Histogram");
+    if (DEBUG_MESSAGES) debugPrintBuffer(queue, histogram_buffer, numBuckets, "Histogram");
 
-    // Launch scan kernel
-    size_t scan_global = 1;
-    size_t scan_local  = 1;
-    cl_event scan_event;
+    size_t scan_global = 1, scan_local  = 1;
     CL_CHECK(clEnqueueNDRangeKernel(queue, scan_kernel, 1, NULL, &scan_global, &scan_local, 0, NULL, &scan_event));
     clWaitForEvents(1, &scan_event);
-    //debugPrintBuffer(queue, cumulative_hist_buffer, numBuckets, "Scan");
+    if (DEBUG_MESSAGES) debugPrintBuffer(queue, cumulative_hist_buffer, numBuckets, "Scan");
 
-    // Launch normalize and scale kernel
-    size_t norm_global = 1;
-    size_t norm_local  = 1;
-    cl_event norm_event;
+    size_t norm_global = 1, norm_local  = 1;
     CL_CHECK(clEnqueueNDRangeKernel(queue, norm_scale_kernel, 1, NULL, &norm_global, &norm_local, 0, NULL, &norm_event));
     clWaitForEvents(1, &norm_event);
-    //debugPrintBuffer(queue, lut_buffer, numBuckets, "NormalizeAndScan");
+    if (DEBUG_MESSAGES) debugPrintBuffer(queue, lut_buffer, numBuckets, "NormalizeAndScan");
 
-    // Launch Backproject kernel
-    size_t out_global = ((pixelCount + local - 1) / local) * local;
-    size_t out_local  = 64;
-    cl_event out_event;
-
-    CL_CHECK(clEnqueueNDRangeKernel(queue, output_kernel, 1, NULL, &out_global, &out_local, 0, NULL, &out_event));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, output_kernel, 1, NULL, &global, &local, 0, NULL, &out_event));
     clWaitForEvents(1, &out_event);
 
-    // For color images, convert back to RGB
-    if (!imageBuffers.desc.isGrayscale) {
+    if (!imageBuffers.desc.isGrayscale) {// For color images, convert back to RGB
         cl_event ycbcr_event;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, ycbcr_to_rgb_kernel, 1, NULL, &out_global, &out_local, 0, NULL, &ycbcr_event));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, ycbcr_to_rgb_kernel, 1, NULL, &global, &local, 0, NULL, &ycbcr_event));
         clWaitForEvents(1, &ycbcr_event);
+        clReleaseEvent(ycbcr_event);
     }
 
+    // Device to Host
     cl_mem read_buffer = imageBuffers.desc.isGrayscale ? equalized_y_buffer : output_buffer;
-    // OUTPUT
     std::vector<unsigned char> output(outputSize);
-    CL_CHECK(clEnqueueReadBuffer(
-        queue,
-        read_buffer,
-        CL_TRUE,
-        0,
-        outputSize,
-        output.data(),
-        0, NULL, NULL));
+ 
+    cl_event read_event;
+    CL_CHECK(clEnqueueReadBuffer(queue, read_buffer, CL_FALSE, 0, outputSize, output.data(), 0, NULL, &read_event));
+    clWaitForEvents(1, &read_event);
 
-    // write to file
+    // Write to file
     std::string out_path = path + resources.output_postfix;
     int stride_multiplier = imageBuffers.desc.isGrayscale ? 1 : 3;
-    int write_ok = stbi_write_png(
+    if (stbi_write_png(
         out_path.c_str(),
         imageBuffers.desc.width,
         imageBuffers.desc.height,
         stride_multiplier,           
         output.data(),
-        imageBuffers.desc.width * stride_multiplier
-    );
-
-    if (!write_ok) {
+        imageBuffers.desc.width * stride_multiplier)
+    ) {
+        std::cout << "Saved: " << out_path << "\n";
+    } else {
         std::cerr << "Failed to write output image\n";
     }
-    std::cout << "Saved: " << out_path << "\n";
 
-    // --- Timing ---
-    std::cout << resources.program_source << "\n";
+    CSVDataRow dataRow;
+    dataRow.imageName       = fs::path(path).filename().string();
+    dataRow.implementation  = resources.program_source;
+    dataRow.imageDescriptor = imageBuffers.desc;
+ 
+    dataRow.histogramTimeUs  = eventDurationUs({histogram_event});
+    dataRow.scanTimeUs       = eventDurationUs({scan_event});
+    dataRow.normScaleTimeUs  = eventDurationUs({norm_event});
+ 
+    dataRow.hostToDeviceTimeUs = eventDurationUs(writeEvents);
+    dataRow.hostToDeviceBytes  = h2dBytes;
+ 
+    dataRow.deviceToHostTimeUs = eventDurationUs({read_event});
+    dataRow.deviceToHostBytes  = outputSize;
 
-    // histogram
-    cl_ulong h_start, h_end;
-    clGetEventProfilingInfo(histogram_event, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &h_start, NULL);
-    clGetEventProfilingInfo(histogram_event, CL_PROFILING_COMMAND_END,   sizeof(cl_ulong), &h_end, NULL);
-    std::cout << "[GPU] Histogram kernel: " << (h_end - h_start) / 1000 << " us\n";
-
-    // scan
-    cl_ulong s_start, s_end;
-    clGetEventProfilingInfo(scan_event, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &s_start, NULL);
-    clGetEventProfilingInfo(scan_event, CL_PROFILING_COMMAND_END,   sizeof(cl_ulong), &s_end, NULL);
-    std::cout << "[GPU] Scan kernel:      " << (s_end - s_start) / 1000 << " us\n";
-    
-    // scan
-    cl_ulong n_start, n_end;
-    clGetEventProfilingInfo(norm_event, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &n_start, NULL);
-    clGetEventProfilingInfo(norm_event, CL_PROFILING_COMMAND_END,   sizeof(cl_ulong), &n_end, NULL);
-    std::cout << "[GPU] NormalizeAndScan kernel:      " << (n_end - n_start) / 1000 << " us\n";
-
-
+    for (cl_event e : writeEvents) clReleaseEvent(e);
+    clReleaseEvent(histogram_event);
+    clReleaseEvent(scan_event);
+    clReleaseEvent(norm_event);
+    clReleaseEvent(out_event);
+    clReleaseEvent(read_event);
+ 
     clReleaseKernel(histogram_kernel);
     clReleaseKernel(scan_kernel);
     clReleaseKernel(norm_scale_kernel);
     clReleaseKernel(output_kernel);
     clReleaseKernel(ycbcr_to_rgb_kernel);
-
-
+ 
     clReleaseMemObject(histogram_buffer);
     clReleaseMemObject(cumulative_hist_buffer);
     clReleaseMemObject(lut_buffer);
-    clReleaseMemObject(output_buffer);
     clReleaseMemObject(equalized_y_buffer);
-    return 0;
-
+    clReleaseMemObject(output_buffer);
+    freeImageBuffers(imageBuffers);
+ 
+    clReleaseProgram(program);
+ 
+    return dataRow;
 }
-
 
 // Supported image configurations:
 // Channels: 1, 3
 // Bit Depth: 8, 16
-int processImage(const std::string& path) {
-    std::cout << "Processing image" << path << std::endl;
+int processImage(const std::string& path, const std::string& buildID) {
+    std::cout << "Processing image: " << path << "\n";
     
-    // Initialize structs
     int width, height, channels;
-    ImageDescriptor imageDesc = {};
-    ImageBuffers imageBuffers = {};
-    imageBuffers.desc = imageDesc;
-
-    int ok = stbi_info(path.c_str(), &width, &height, &channels);
-    if (!ok) {
+    if (!stbi_info(path.c_str(), &width, &height, &channels)) {
         std::cerr << "Failed to get image info\n";
         return 1;
     }
-
-    imageBuffers.desc.width = width;
-    imageBuffers.desc.height = height;
-    imageBuffers.desc.isGrayscale = (channels == 1);
-    imageBuffers.desc.bitDepth = stbi_is_16_bit(path.c_str()) ? BitDepth::U16 : BitDepth::U8;
-
-    if (channels != 3 && channels != 1) {
-        std::cerr << "Unsupported number of channels: " << channels << "\n";
+    if (channels != 1 && channels != 3) {
+        std::cerr << "Unsupported channel count: " << channels << "\n";
         return 1;
     }
-    imageBuffers.planeCount = channels;
-    size_t PIXEL_COUNT = width * height;
-
+ 
+    ImageDescriptor desc = {};
+    desc.width       = (uint32_t)width;
+    desc.height      = (uint32_t)height;
+    desc.isGrayscale = (channels == 1);
+    desc.bitDepth    = stbi_is_16_bit(path.c_str()) ? BitDepth::U16 : BitDepth::U8;
+ 
+    size_t pixelCount = (size_t)width * height;
+ 
+    // Load raw pixels into host memory
+    RawImageData rawData;
+    if (desc.bitDepth == BitDepth::U8) {
+        unsigned char* img = stbi_load(path.c_str(), &width, &height, &channels, 0);
+        if (!img) { 
+            std::cerr << "Failed to load image\n"; 
+            return 1; 
+        }
+        rawData.data8.assign(img, img + pixelCount * channels);
+        stbi_image_free(img);
+        std::cout << "Loaded " << (desc.isGrayscale ? "grayscale" : "color") << " 8-bit image: " << width << "x" << height << "\n";
+    } else {
+        unsigned short* img = (unsigned short*)stbi_load_16(path.c_str(), &width, &height, &channels, 0);
+        if (!img) { 
+            std::cerr << "Failed to load 16-bit image\n"; 
+            return 1; 
+        }
+        rawData.data16.assign(img, img + pixelCount * channels);
+        stbi_image_free(img);
+        std::cout << "Loaded " << (desc.isGrayscale ? "grayscale" : "color") << " 16-bit image: " << width << "x" << height << "\n";
+    }
+ 
     // OpenCL setup
     cl_int err;
-
     cl_platform_id platform;
     CL_CHECK(clGetPlatformIDs(1, &platform, NULL));
-
     cl_device_id device;
     CL_CHECK(clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &device, NULL));
-
+ 
     cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
     CL_CHECK(err);
-
-    cl_queue_properties props[] = {
-        CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE,
-        0
-    };
-    cl_command_queue queue = clCreateCommandQueueWithProperties(
-        context, device, props, &err);
+ 
+    cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
+    cl_command_queue queue = clCreateCommandQueueWithProperties(context, device, props, &err);
     CL_CHECK(err);
-
-    // Load image data and create buffers
-    if (imageBuffers.desc.bitDepth == BitDepth::U8){
-        unsigned char* image_8b = stbi_load(path.c_str(), &width, &height, &channels, 0);
-        if (!image_8b) {
-            std::cerr << "Failed to load image\n";
-            return 1;
-        }
-
-        if (imageBuffers.desc.isGrayscale) {
-            std::cout << "Loaded grayscale image: w=" << width << " h=" << height << " c=" << channels << "\n";
-            // Allocate memory for the grayscale plane
-            imageBuffers.planes[0] = allocPlane(context, width, height, imageBuffers.desc.bitDepth, &err);
-            CL_CHECK(err);
-            err = clEnqueueWriteBuffer(queue, imageBuffers.planes[0], CL_TRUE, 0, PIXEL_COUNT * sizeof(uint8_t), image_8b, 0, NULL, NULL);
-            CL_CHECK(err);
-        } else {
-            std::cout << "Loaded color image: w=" << width << " h=" << height << " c=" << channels << "\n";
-            // Convert to YCbCr
-            std::vector<uint8_t> planeY (PIXEL_COUNT);
-            std::vector<uint8_t> planeCb(PIXEL_COUNT);
-            std::vector<uint8_t> planeCr(PIXEL_COUNT);
-
-            for (size_t i = 0; i < PIXEL_COUNT; i++) {
-                float r = (float)image_8b[i * 3 + 0];
-                float g = (float)image_8b[i * 3 + 1];
-                float b = (float)image_8b[i * 3 + 2];
-
-                // Convert RGB to YCbCr
-                planeY [i] = (uint8_t)std::clamp((0.299f * r + 0.587f * g + 0.114f * b), 0.0f, 255.0f);
-                planeCb[i] = (uint8_t)std::clamp((-0.168736f * r - 0.331264f * g + 0.5f * b + 128.0f), 0.0f, 255.0f);
-                planeCr[i] = (uint8_t)std::clamp((0.5f * r - 0.418688f * g - 0.081312f * b + 128.0f), 0.0f, 255.0f);
-            }
-
-            for (uint32_t i = 0; i < 3; i++) {
-                imageBuffers.planes[i] = allocPlane(context, width, height, imageBuffers.desc.bitDepth, &err);
-                if (err != CL_SUCCESS) {
-                    freeImageBuffers(imageBuffers);
-                    std::cout << "Failed to allocate memory for image planes\n"; 
-                    return 1;
-                }
-            }
-            err = clEnqueueWriteBuffer(queue, imageBuffers.planes[0], CL_TRUE, 0, PIXEL_COUNT * sizeof(uint8_t), planeY.data(), 0, NULL, NULL);
-            CL_CHECK(err);
-            err = clEnqueueWriteBuffer(queue, imageBuffers.planes[1], CL_TRUE, 0, PIXEL_COUNT * sizeof(uint8_t), planeCb.data(), 0, NULL, NULL);
-            CL_CHECK(err);
-            err = clEnqueueWriteBuffer(queue, imageBuffers.planes[2], CL_TRUE, 0, PIXEL_COUNT * sizeof(uint8_t), planeCr.data(), 0, NULL, NULL);
-            CL_CHECK(err);
-        }
-        stbi_image_free(image_8b);  
-    } else {
-        // 16-bit image loading 
-        unsigned short* image_16b = (unsigned short*)stbi_load_16(path.c_str(), &width, &height, &channels, 0);
-        if (!image_16b) {
-            std::cerr << "Failed to load 16-bit image\n";
-            return 1;
-        }
-
-        if (imageBuffers.desc.isGrayscale) {
-            std::cout << "Loaded grayscale 16-bit image: w=" << width << " h=" << height << " c=" << channels << "\n";
-            imageBuffers.planes[0] = allocPlane(context, width, height, imageBuffers.desc.bitDepth, &err);
-            CL_CHECK(err);
-            err = clEnqueueWriteBuffer(queue, imageBuffers.planes[0], CL_TRUE, 0, PIXEL_COUNT * sizeof(uint16_t), image_16b, 0, NULL, NULL);
-            CL_CHECK(err);
-        } else {
-            std::cout << "Loaded color 16-bit image: w=" << width << " h=" << height << " c=" << channels << "\n";
-            // Convert to YCbCr
-            std::vector<uint16_t> planeY (PIXEL_COUNT);
-            std::vector<uint16_t> planeCb(PIXEL_COUNT);
-            std::vector<uint16_t> planeCr(PIXEL_COUNT);
-
-            for (size_t i = 0; i < PIXEL_COUNT; i++) {
-                float r = (float)image_16b[i * 3 + 0];
-                float g = (float)image_16b[i * 3 + 1];
-                float b = (float)image_16b[i * 3 + 2];
-
-                // Convert RGB to YCbCr
-                planeY [i] = (uint16_t)std::clamp((0.299f * r + 0.587f * g + 0.114f * b), 0.0f, 65535.0f);
-                planeCb[i] = (uint16_t)std::clamp((-0.168736f * r - 0.331264f * g + 0.5f * b + 32768.0f), 0.0f, 65535.0f);
-                planeCr[i] = (uint16_t)std::clamp((0.5f * r - 0.418688f * g - 0.081312f * b + 32768.0f), 0.0f, 65535.0f);
-            }
-
-            for (uint32_t i = 0; i < 3; i++) {
-                imageBuffers.planes[i] = allocPlane(context, width, height, imageBuffers.desc.bitDepth, &err);
-                if (err != CL_SUCCESS) {
-                    freeImageBuffers(imageBuffers);
-                    std::cout << "Failed to allocate memory for image planes\n"; 
-                    return 1;
-                }
-            }
-            err = clEnqueueWriteBuffer(queue, imageBuffers.planes[0], CL_TRUE, 0, PIXEL_COUNT * sizeof(uint16_t), planeY.data(), 0, NULL, NULL);
-            CL_CHECK(err);
-            err = clEnqueueWriteBuffer(queue, imageBuffers.planes[1], CL_TRUE, 0, PIXEL_COUNT * sizeof(uint16_t), planeCb.data(), 0, NULL, NULL);
-            CL_CHECK(err);
-            err = clEnqueueWriteBuffer(queue, imageBuffers.planes[2], CL_TRUE, 0, PIXEL_COUNT * sizeof(uint16_t), planeCr.data(), 0, NULL, NULL);
-            CL_CHECK(err);
-        }
-        stbi_image_free(image_16b);
-    }
-
-    if (imageBuffers.desc.bitDepth == BitDepth::U8) {
-        std::cout << "Image bit depth: 8-bit\n";
-    } else {
-        std::cout << "Image bit depth: 16-bit\n";
-    }
-
-    OpenCLResources allResources[] = {
-        NAIVE_IMPLEMENTATION
-    };
-
+ 
+    OpenCLResources allResources[] = { NAIVE_IMPLEMENTATION };
+ 
     for (OpenCLResources& resource : allResources) {
-        processOpenCL(resource, imageBuffers, context, queue, device, path);
+        CSVDataRow row = processOpenCL(resource, desc, rawData, context, queue, device, path);
+        row.buildID = buildID;
+        writeCSV(row);
+        std::cout << "[CSV] Wrote row for " << row.imageName << " (" << row.implementation << ")\n";
     }
-
-    // Release stuff at end
-    freeImageBuffers(imageBuffers);
-    //clReleaseKernel(kernel);
-    //clReleaseProgram(program);
+ 
     clReleaseCommandQueue(queue);
     clReleaseContext(context);
-    
     return 0;
 }
 
+// BuildID is just a unix timestamp, for the purposes of this assignment its good enough
+static std::string makeBuildID() {
+    auto now = std::chrono::system_clock::now();
+    return std::to_string(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            now.time_since_epoch()).count());
+}
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -691,8 +699,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::string buildID = makeBuildID();
+
     for (const auto& path : imagePaths) {
-        processImage(path);
+        processImage(path, buildID);
     }
 
     return 0;
