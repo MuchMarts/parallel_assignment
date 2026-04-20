@@ -6,6 +6,8 @@
 #include <sstream>
 #include <algorithm>
 
+#include <png.h>
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -262,6 +264,7 @@ struct OpenCLResources {
     char * scan_kernel;
     char * norm_scale_kernel;
     char * output_kernel;
+    bool chunked_histogram = false;
 };
 
 OpenCLResources NAIVE_IMPLEMENTATION = OpenCLResources{
@@ -270,18 +273,19 @@ OpenCLResources NAIVE_IMPLEMENTATION = OpenCLResources{
     .histogram_kernel = (char *)"Histogram",
     .scan_kernel = (char *)"Scan",
     .norm_scale_kernel = (char *)"NormaliseAndScale",
-    .output_kernel = (char *)"Backproject"
+    .output_kernel = (char *)"Backproject",
+    .chunked_histogram = false
 };
 
-OpenCLResources OPTIMIZED_HISTOGRAM = OpenCLResources{
+OpenCLResources OPTIMIZED_IMPLEMENTATION = OpenCLResources{
     .output_postfix = "_optimized_equalized.png",
-    .program_source = "optimized_histogram.cl",
+    .program_source = "optimized.cl",
     .histogram_kernel = (char *)"Histogram",
     .scan_kernel = (char *)"Scan",
     .norm_scale_kernel = (char *)"NormaliseAndScale",
-    .output_kernel = (char *)"Backproject"
+    .output_kernel = (char *)"Backproject",
+    .chunked_histogram = true
 };
-
 
 struct CSVDataRow {
     std::string buildID;
@@ -334,6 +338,39 @@ static void writeCSV(const CSVDataRow& row) {
       << row.deviceToHostBytes                               << '\n';
 }
 
+void write_png_16bit(const std::string& path, uint16_t* data, int width, int height, int channels) {
+    FILE* fp = fopen(path.c_str(), "wb");
+    if (!fp) { std::cerr << "Failed to open file for writing: " << path << "\n"; return; }
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    png_infop info  = png_create_info_struct(png);
+
+    if (setjmp(png_jmpbuf(png))) {
+        std::cerr << "PNG write error\n";
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        return;
+    }
+
+    png_init_io(png, fp);
+
+    int color_type = (channels == 1) ? PNG_COLOR_TYPE_GRAY : PNG_COLOR_TYPE_RGB;
+    png_set_IHDR(png, info, width, height, 16, color_type,
+        PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+
+    png_set_swap(png); // x86 is little-endian, PNG expects big-endian
+
+    std::vector<uint16_t*> rows(height);
+    for (int y = 0; y < height; y++)
+        rows[y] = data + y * width * channels;
+
+    png_write_image(png, (png_bytepp)rows.data());
+    png_write_end(png, NULL);
+    png_destroy_write_struct(&png, &info);
+    fclose(fp);
+}
+
 CSVDataRow processOpenCL(
     OpenCLResources& resources, 
     ImageDescriptor& imageDescriptor, 
@@ -374,7 +411,7 @@ CSVDataRow processOpenCL(
 
     uint32_t numBuckets   = (imageDescriptor.bitDepth == BitDepth::U16) ? 65536 : 256;
     uint32_t maxIntensity = (imageDescriptor.bitDepth == BitDepth::U16) ? 65535 : 255;
-    size_t   pixelCount   = imageDescriptor.width * imageDescriptor.height;
+    cl_uint pixelCount   = imageDescriptor.width * imageDescriptor.height;
 
     // Allocate image planes
     ImageBuffers imageBuffers = {};
@@ -476,7 +513,7 @@ CSVDataRow processOpenCL(
     // # HISTOGRAM
     clSetKernelArg(histogram_kernel, 0, sizeof(cl_mem), &imageBuffers.planes[0]);
     clSetKernelArg(histogram_kernel, 1, sizeof(cl_mem), &histogram_buffer);
-    clSetKernelArg(histogram_kernel, 2, sizeof(uint), &pixelCount);
+    clSetKernelArg(histogram_kernel, 2, sizeof(cl_uint), &pixelCount);
     clSetKernelArg(histogram_kernel, 3, sizeof(uint), &numBuckets);
     // # SCAN
     clSetKernelArg(scan_kernel, 0, sizeof(cl_mem), &histogram_buffer);
@@ -485,7 +522,7 @@ CSVDataRow processOpenCL(
     // # NORMALISE_AND_SCALE
     clSetKernelArg(norm_scale_kernel, 0, sizeof(cl_mem), &cumulative_hist_buffer);
     clSetKernelArg(norm_scale_kernel, 1, sizeof(cl_mem), &lut_buffer);
-    clSetKernelArg(norm_scale_kernel, 2, sizeof(uint), &pixelCount);
+    clSetKernelArg(norm_scale_kernel, 2, sizeof(cl_uint), &pixelCount);
     clSetKernelArg(norm_scale_kernel, 3, sizeof(uint), &numBuckets);
     clSetKernelArg(norm_scale_kernel, 4, sizeof(uint), &maxIntensity);
     // # BACKPROJECT
@@ -497,26 +534,110 @@ CSVDataRow processOpenCL(
     clSetKernelArg(ycbcr_to_rgb_kernel, 1, sizeof(cl_mem), &imageBuffers.planes[1]);
     clSetKernelArg(ycbcr_to_rgb_kernel, 2, sizeof(cl_mem), &imageBuffers.planes[2]);
     clSetKernelArg(ycbcr_to_rgb_kernel, 3, sizeof(cl_mem), &output_buffer);
-    clSetKernelArg(ycbcr_to_rgb_kernel, 4, sizeof(uint), &pixelCount);
+    clSetKernelArg(ycbcr_to_rgb_kernel, 4, sizeof(cl_uint), &pixelCount);
+
+    //
+    // Histogram kernel, optimizations
+    //
+    cl_ulong device_local_mem;
+    clGetDeviceInfo(device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(cl_ulong), &device_local_mem, NULL);
+
+    size_t kernel_local_usage;
+    clGetKernelWorkGroupInfo(histogram_kernel, device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(size_t), &kernel_local_usage, NULL);
+
+    size_t preferred_multiple;
+    clGetKernelWorkGroupInfo(histogram_kernel, device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(size_t), &preferred_multiple, NULL);
+
+    size_t max_work_group_size;
+    clGetKernelWorkGroupInfo(histogram_kernel, device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &max_work_group_size, NULL);
+
+    size_t available = device_local_mem - kernel_local_usage;
+    size_t max_bins  = available / sizeof(cl_uint);
+
+    // 8-bit: ideal is 256 local (1:1 with bins), cap at device limits
+    size_t local_8bit = 256;
+    if (local_8bit > max_work_group_size) {
+        // round down to largest power-of-2 multiple of preferred_multiple
+        local_8bit = preferred_multiple;
+        while (local_8bit * 2 <= max_work_group_size) local_8bit *= 2;
+    }
+
+    // 16-bit: chunk size = largest power-of-2 that fits in local mem, capped at 65536
+    size_t chunk_16bit = 1;
+    while (chunk_16bit * 2 <= max_bins && chunk_16bit * 2 <= 65536)
+        chunk_16bit *= 2;
+    // ensure chunk is a multiple of local work size so loops divide evenly
+    size_t local_16bit = 256; // same local size, chunks handle the bin range
+    chunk_16bit = (chunk_16bit / local_16bit) * local_16bit;
+    uint   num_chunks  = (65536 + chunk_16bit - 1) / chunk_16bit;
 
     //
     // Enqueue kernels
     //
-    size_t local  = 256;
+    CSVDataRow dataRow;
+
+
+    uint   numBucketsActual = (imageBuffers.desc.bitDepth == BitDepth::U8) ? 256 : 65536;
+    size_t local  = (imageBuffers.desc.bitDepth == BitDepth::U8) ? local_8bit : local_16bit;
     size_t global = ((pixelCount + local - 1) / local) * local;
-    
+
+    std::cout << "Global Work Size: " << global << ", Local Work Size: " << local << "\n";
+    std::cout << "local_size: " << device_local_mem << " max workgroup: " << max_work_group_size << "\n";
+
+    cl_uint zero = 0;
+    clEnqueueFillBuffer(queue, histogram_buffer, &zero, sizeof(cl_uint), 0, 
+    numBuckets * sizeof(cl_uint), 0, NULL, NULL);
+    clFinish(queue);
+
     cl_event histogram_event, scan_event, norm_event, out_event;
 
-    CL_CHECK(clEnqueueNDRangeKernel(queue, histogram_kernel, 1, NULL, &global, &local, 0, NULL, &histogram_event));
-    clWaitForEvents(1, &histogram_event);
-    if (DEBUG_MESSAGES) debugPrintBuffer(queue, histogram_buffer, numBuckets, "Histogram");
+    cl_uint chunk_16bit_u = (cl_uint)chunk_16bit;
+    std::cout << "Chunk Size (16-bit): " << chunk_16bit << "\n";
+    bool histogram_timed = false;
+    if (imageBuffers.desc.bitDepth == BitDepth::U8) {
+        CL_CHECK(clEnqueueNDRangeKernel(queue, histogram_kernel, 1, NULL,
+            &global, &local, 0, NULL, &histogram_event));
+        clWaitForEvents(1, &histogram_event);
+
+    } else if (resources.chunked_histogram) {
+        // 16-bit optimized
+        cl_uint bin_offset_zero = 0;
+        clSetKernelArg(histogram_kernel, 4, sizeof(cl_uint), &chunk_16bit_u);
+        clSetKernelArg(histogram_kernel, 5, sizeof(cl_uint), &bin_offset_zero);
+        clSetKernelArg(histogram_kernel, 6, chunk_16bit * sizeof(cl_uint), NULL);
+
+        cl_uint zero = 0;
+        clEnqueueFillBuffer(queue, histogram_buffer, &zero, sizeof(cl_uint), 0,
+            numBuckets * sizeof(cl_uint), 0, NULL, NULL);
+        clFinish(queue);
+
+        std::vector<cl_event> chunk_events(num_chunks);
+        for (uint chunk = 0; chunk < num_chunks; chunk++) {
+            cl_uint bin_offset = chunk * chunk_16bit_u;
+            clSetKernelArg(histogram_kernel, 5, sizeof(cl_uint), &bin_offset);
+            CL_CHECK(clEnqueueNDRangeKernel(queue, histogram_kernel, 1, NULL,
+                &global, &local, 0, NULL, &chunk_events[chunk]));
+        }
+        clWaitForEvents(num_chunks, chunk_events.data());
+        
+        // but sum all chunks for accurate total time:
+        dataRow.histogramTimeUs = eventDurationUs(chunk_events);
+        histogram_timed = true;
+        for (cl_event e : chunk_events) clReleaseEvent(e);
+
+    } else {
+        // 16-bit naive — plain global atomics, no extra args
+        CL_CHECK(clEnqueueNDRangeKernel(queue, histogram_kernel, 1, NULL,
+            &global, &local, 0, NULL, &histogram_event));
+        clWaitForEvents(1, &histogram_event);
+    }
 
     size_t scan_global = 1, scan_local  = 1;
     CL_CHECK(clEnqueueNDRangeKernel(queue, scan_kernel, 1, NULL, &scan_global, &scan_local, 0, NULL, &scan_event));
     clWaitForEvents(1, &scan_event);
     if (DEBUG_MESSAGES) debugPrintBuffer(queue, cumulative_hist_buffer, numBuckets, "Scan");
 
-    size_t norm_global = 1, norm_local  = 1;
+    size_t norm_global = numBuckets, norm_local  = 256;
     CL_CHECK(clEnqueueNDRangeKernel(queue, norm_scale_kernel, 1, NULL, &norm_global, &norm_local, 0, NULL, &norm_event));
     clWaitForEvents(1, &norm_event);
     if (DEBUG_MESSAGES) debugPrintBuffer(queue, lut_buffer, numBuckets, "NormalizeAndScan");
@@ -533,34 +654,40 @@ CSVDataRow processOpenCL(
 
     // Device to Host
     cl_mem read_buffer = imageBuffers.desc.isGrayscale ? equalized_y_buffer : output_buffer;
-    std::vector<unsigned char> output(outputSize);
- 
+
+    std::vector<uint16_t> output16;
+    std::vector<uint8_t>  output8;
+
+    void* outputPtr;
+    if (imageBuffers.desc.bitDepth == BitDepth::U16) {
+        output16.resize(outputSize / sizeof(uint16_t));
+        outputPtr = output16.data();
+    } else {
+        output8.resize(outputSize);
+        outputPtr = output8.data();
+    }
     cl_event read_event;
-    CL_CHECK(clEnqueueReadBuffer(queue, read_buffer, CL_FALSE, 0, outputSize, output.data(), 0, NULL, &read_event));
+    CL_CHECK(clEnqueueReadBuffer(queue, read_buffer, CL_FALSE, 0, outputSize, outputPtr, 0, NULL, &read_event));
     clWaitForEvents(1, &read_event);
 
     // Write to file
     std::string out_path = path + resources.output_postfix;
     int stride_multiplier = imageBuffers.desc.isGrayscale ? 1 : 3;
-    if (stbi_write_png(
-        out_path.c_str(),
-        imageBuffers.desc.width,
-        imageBuffers.desc.height,
-        stride_multiplier,           
-        output.data(),
-        imageBuffers.desc.width * stride_multiplier)
-    ) {
-        std::cout << "Saved: " << out_path << "\n";
+    
+    if (imageBuffers.desc.bitDepth == BitDepth::U16) {
+        write_png_16bit(out_path, output16.data(), imageBuffers.desc.width, imageBuffers.desc.height, stride_multiplier);
     } else {
-        std::cerr << "Failed to write output image\n";
+        stbi_write_png(out_path.c_str(), imageBuffers.desc.width, imageBuffers.desc.height,
+            stride_multiplier, output8.data(), imageBuffers.desc.width * stride_multiplier);
     }
 
-    CSVDataRow dataRow;
     dataRow.imageName       = fs::path(path).filename().string();
     dataRow.implementation  = resources.program_source;
     dataRow.imageDescriptor = imageBuffers.desc;
- 
-    dataRow.histogramTimeUs  = eventDurationUs({histogram_event});
+
+    if (!histogram_timed) { 
+        dataRow.histogramTimeUs  = eventDurationUs({histogram_event}); 
+    }
     dataRow.scanTimeUs       = eventDurationUs({scan_event});
     dataRow.normScaleTimeUs  = eventDurationUs({norm_event});
  
@@ -571,7 +698,7 @@ CSVDataRow processOpenCL(
     dataRow.deviceToHostBytes  = outputSize;
 
     for (cl_event e : writeEvents) clReleaseEvent(e);
-    clReleaseEvent(histogram_event);
+    if (!histogram_timed) clReleaseEvent(histogram_event); // guarded
     clReleaseEvent(scan_event);
     clReleaseEvent(norm_event);
     clReleaseEvent(out_event);
@@ -639,8 +766,12 @@ int processImage(const std::string& path, const std::string& buildID) {
         rawData.data16.assign(img, img + pixelCount * channels);
         stbi_image_free(img);
         std::cout << "Loaded " << (desc.isGrayscale ? "grayscale" : "color") << " 16-bit image: " << width << "x" << height << "\n";
+        std::cout << "First pixel RGB: " 
+          << rawData.data16[0] << " "
+          << rawData.data16[1] << " "
+          << rawData.data16[2] << "\n";
     }
- 
+
     // OpenCL setup
     cl_int err;
     cl_platform_id platform;
@@ -655,7 +786,7 @@ int processImage(const std::string& path, const std::string& buildID) {
     cl_command_queue queue = clCreateCommandQueueWithProperties(context, device, props, &err);
     CL_CHECK(err);
 
-    OpenCLResources allResources[] = { OPTIMIZED_HISTOGRAM };
+    OpenCLResources allResources[] = { NAIVE_IMPLEMENTATION, OPTIMIZED_IMPLEMENTATION };
 
     for (OpenCLResources& resource : allResources) {
         CSVDataRow row = processOpenCL(resource, desc, rawData, context, queue, device, path);

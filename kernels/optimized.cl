@@ -45,24 +45,37 @@ __kernel void Histogram(
 #endif
 
 #ifdef DEPTH_16
-
 __kernel void Histogram(
     __global const pixel_t *data,
-    __global       uint *histogram,
-             const uint  data_length,
-             const uint  num_buckets
+    __global       uint    *histogram,
+    const uint  data_length,
+    const uint  num_buckets,
+    const uint  chunk_size,
+    const uint  bin_offset,
+    __local  uint *local_histogram
 ) {
-    uint i = get_global_id(0);
-    if (i < data_length) {
-        uint value = data[i];
-        if (value < num_buckets) {
-            atomic_inc(&histogram[value]);
+    uint gid   = get_global_id(0);
+    uint lid   = get_local_id(0);
+    uint lsize = get_local_size(0);
+
+    for (uint i = lid; i < chunk_size; i += lsize){
+        local_histogram[i] = 0;
+    
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (gid < data_length) {
+        uint value = data[gid];
+        if (value >= bin_offset && value < bin_offset + chunk_size) {
+            atomic_inc(&local_histogram[value - bin_offset]);
         }
     }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint i = lid; i < chunk_size; i += lsize)
+        atomic_add(&histogram[bin_offset + i], local_histogram[i]);
 }
-
 #endif
-
 
 __kernel void Scan(
     __global const uint *histogram,
@@ -85,10 +98,9 @@ __kernel void NormaliseAndScale(
     const uint num_buckets,
     const uint max_intensity
 ) {
-    if (get_global_id(0) == 0) {
-        for (uint i = 0; i < num_buckets; i++) {
-            lut[i] = (cumulative[i] * max_intensity) / total_pixels;
-        }
+    uint i = get_global_id(0);
+    if (i < num_buckets) {
+        lut[i] = (ulong)((ulong)cumulative[i] * (ulong)max_intensity) / (ulong)total_pixels;
     }
 }
 

@@ -48,7 +48,7 @@ __kernel void NormaliseAndScale(
 ) {
     if (get_global_id(0) == 0) {
         for (uint i = 0; i < num_buckets; i++) {
-            lut[i] = (cumulative[i] * max_intensity) / total_pixels;
+            lut[i] = (uint)(((ulong)cumulative[i] * (ulong)max_intensity) / (ulong)total_pixels);
         }
     }
 }

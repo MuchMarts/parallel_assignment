@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(OpenCL REQUIRED)
 
 add_executable(histeq main.cpp)
-target_link_libraries(histeq OpenCL::OpenCL) # fetch online
+target_link_libraries(histeq OpenCL::OpenCL png) # fetch online
 
 target_compile_definitions(
     histeq PRIVATE CL_TARGET_OPENCL_VERSION=300
@@ -19,7 +19,7 @@ configure_file(
 )
 
 configure_file(
-    ${CMAKE_SOURCE_DIR}/kernels/optimized_histogram.cl
-    ${CMAKE_BINARY_DIR}/optimized_histogram.cl
+    ${CMAKE_SOURCE_DIR}/kernels/optimized.cl
+    ${CMAKE_BINARY_DIR}/optimized.cl
     COPYONLY
 )
