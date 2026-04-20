@@ -10,6 +10,42 @@
     #define CHROMA_OFFSET 128
 #endif
 
+
+#ifdef DEPTH_8
+// Optimized histogram using local memory
+__kernel void Histogram(
+    __global const pixel_t *data,
+    __global       uint *histogram,
+             const uint  data_length,
+             const uint  num_buckets
+) {
+    uint gid = get_global_id(0);
+    uint lid = get_local_id(0);
+    uint lsize = get_local_size(0);
+
+    uint bin_index = data[gid];
+
+    __local uint local_histogram[256];
+    for (int i = lid; i < num_buckets; i += lsize)
+        local_histogram[i] = 0;
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if(gid < data_length){
+        atomic_inc(&local_histogram[bin_index]);
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    // Merge local histograms
+    for (int i = lid; i < num_buckets; i += lsize) {
+        atomic_add(&histogram[i], local_histogram[i]);
+    }
+}
+#endif
+
+#ifdef DEPTH_16
+
 __kernel void Histogram(
     __global const pixel_t *data,
     __global       uint *histogram,
@@ -24,6 +60,9 @@ __kernel void Histogram(
         }
     }
 }
+
+#endif
+
 
 __kernel void Scan(
     __global const uint *histogram,

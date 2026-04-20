@@ -17,3 +17,9 @@ configure_file(
     ${CMAKE_BINARY_DIR}/naive.cl
     COPYONLY
 )
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/kernels/optimized_histogram.cl
+    ${CMAKE_BINARY_DIR}/optimized_histogram.cl
+    COPYONLY
+)

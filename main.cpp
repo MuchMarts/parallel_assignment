@@ -273,6 +273,16 @@ OpenCLResources NAIVE_IMPLEMENTATION = OpenCLResources{
     .output_kernel = (char *)"Backproject"
 };
 
+OpenCLResources OPTIMIZED_HISTOGRAM = OpenCLResources{
+    .output_postfix = "_optimized_equalized.png",
+    .program_source = "optimized_histogram.cl",
+    .histogram_kernel = (char *)"Histogram",
+    .scan_kernel = (char *)"Scan",
+    .norm_scale_kernel = (char *)"NormaliseAndScale",
+    .output_kernel = (char *)"Backproject"
+};
+
+
 struct CSVDataRow {
     std::string buildID;
     std::string imageName;
@@ -337,6 +347,10 @@ CSVDataRow processOpenCL(
     cl_int err;
     
     std::string kernelSrc = readFile(resources.program_source);
+    if (kernelSrc.empty()) {
+        std::cerr << "Failed to read kernel source: " << resources.program_source << "\n";
+        return CSVDataRow{};
+    }
     const char* src = kernelSrc.c_str();
 
     cl_program program = clCreateProgramWithSource(context, 1, &src, NULL, &err);
@@ -488,7 +502,7 @@ CSVDataRow processOpenCL(
     //
     // Enqueue kernels
     //
-    size_t local  = 64;
+    size_t local  = 256;
     size_t global = ((pixelCount + local - 1) / local) * local;
     
     cl_event histogram_event, scan_event, norm_event, out_event;
@@ -640,9 +654,9 @@ int processImage(const std::string& path, const std::string& buildID) {
     cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
     cl_command_queue queue = clCreateCommandQueueWithProperties(context, device, props, &err);
     CL_CHECK(err);
- 
-    OpenCLResources allResources[] = { NAIVE_IMPLEMENTATION };
- 
+
+    OpenCLResources allResources[] = { OPTIMIZED_HISTOGRAM };
+
     for (OpenCLResources& resource : allResources) {
         CSVDataRow row = processOpenCL(resource, desc, rawData, context, queue, device, path);
         row.buildID = buildID;
