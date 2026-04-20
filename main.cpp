@@ -564,9 +564,10 @@ CSVDataRow processOpenCL(
 
     // 16-bit: chunk size = largest power-of-2 that fits in local mem, capped at 65536
     size_t chunk_16bit = 1;
-    while (chunk_16bit * 2 <= max_bins && chunk_16bit * 2 <= 65536)
+    while (chunk_16bit * 2 <= max_bins && chunk_16bit * 2 <= 65536){
         chunk_16bit *= 2;
-    // ensure chunk is a multiple of local work size so loops divide evenly
+    }
+    
     size_t local_16bit = 256; // same local size, chunks handle the bin range
     chunk_16bit = (chunk_16bit / local_16bit) * local_16bit;
     uint   num_chunks  = (65536 + chunk_16bit - 1) / chunk_16bit;
@@ -626,7 +627,7 @@ CSVDataRow processOpenCL(
         for (cl_event e : chunk_events) clReleaseEvent(e);
 
     } else {
-        // 16-bit naive — plain global atomics, no extra args
+        // 16-bit naive
         CL_CHECK(clEnqueueNDRangeKernel(queue, histogram_kernel, 1, NULL,
             &global, &local, 0, NULL, &histogram_event));
         clWaitForEvents(1, &histogram_event);
